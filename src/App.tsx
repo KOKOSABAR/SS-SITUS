@@ -90,6 +90,7 @@ export default function App() {
   const [autoSyncToSheets, setAutoSyncToSheets] = useState<boolean>(() => {
     return localStorage.getItem('auto_sync_to_sheets') !== 'false';
   });
+  const didInitialAutoPush = useRef<boolean>(false);
 
   // Saved Screenshot Gallery
   const [screenshots, setScreenshots] = useState<ScreenshotFile[]>([]);
@@ -312,6 +313,22 @@ export default function App() {
     fetchScreenshots();
   }, []);
 
+  // Auto push sekali saat aplikasi pertama kali memuat data lokal,
+  // agar kategori yang ada di dashboard langsung masuk ke Google Sheets tanpa klik manual.
+  useEffect(() => {
+    if (didInitialAutoPush.current) return;
+    if (loading) return;
+    if (!autoSyncToSheets) return;
+    if (!googleSheetUrl) return;
+    if (rows.length === 0) return;
+
+    didInitialAutoPush.current = true;
+    // Beri jeda kecil agar render stabil + backend siap
+    setTimeout(() => {
+      handleSheetPush();
+    }, 800);
+  }, [loading, rows.length, autoSyncToSheets, googleSheetUrl]);
+
   // Show status toasts
   const showToast = (message: string, type: 'success' | 'info' | 'error' = 'success') => {
     setToast({ message, type });
@@ -370,6 +387,8 @@ export default function App() {
             setRows(payload.data);
             setSelectedRowIds(new Set());
             showToast('Spreadsheet berhasil diatur ulang ke links default!', 'success');
+            // Setelah reset, langsung sinkronkan ke Google Sheets agar kategori ter-update otomatis
+            setTimeout(() => triggerAutoSilentPush(), 600);
           } else {
             showToast('Gagal mereset database', 'error');
           }
