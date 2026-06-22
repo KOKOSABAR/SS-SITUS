@@ -3,7 +3,8 @@ import { app } from "../server";
 export default app;
 
 export const config = {
-  // Pastikan function berjalan di Node.js runtime (Express + fs butuh Node runtime).
-  runtime: "nodejs20.x",
+  // Vercel config mendukung runtime: "nodejs" | "edge" | "experimental-edge"
+  // Express + fs butuh Node.js.
+  runtime: "nodejs",
   maxDuration: 60,
 };

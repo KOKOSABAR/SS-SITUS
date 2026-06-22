@@ -4,7 +4,6 @@ import { app } from "../server";
 export default app;
 
 export const config = {
-  runtime: "nodejs20.x",
+  runtime: "nodejs",
   maxDuration: 60,
 };
-
