@@ -768,7 +768,7 @@ export default function App() {
           break;
         } else {
           const errorData = await res.json().catch(() => ({} as any));
-          lastErr = errorData?.error || 'Gagal menyimpan screenshot (unknown error)';
+          lastErr = errorData?.error || res.statusText || `HTTP ${res.status}`;
           log(`❌ Gagal menyimpan file: ${lastErr}`);
         }
       }
@@ -882,7 +882,7 @@ export default function App() {
             break;
           } else {
             const errorData = await res.json().catch(() => ({} as any));
-            log(`❌ Gagal menyimpan screenshot "${row.category}": ${errorData?.error || 'unknown error'}`);
+            log(`❌ Gagal menyimpan screenshot "${row.category}": ${errorData?.error || res.statusText || `HTTP ${res.status}`}`);
           }
         }
 
@@ -1017,7 +1017,7 @@ export default function App() {
                 break;
               } else {
                 const errorData = await res.json().catch(() => ({} as any));
-                log(`❌ Gagal menyimpan screenshot "${row.category}": ${errorData?.error || 'unknown error'}`);
+                log(`❌ Gagal menyimpan screenshot "${row.category}": ${errorData?.error || res.statusText || `HTTP ${res.status}`}`);
               }
             }
 

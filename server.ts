@@ -1,13 +1,20 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
 import { INITIAL_SPREADSHEET_DATA } from "./src/data";
 import { SpreadsheetRow, ScreenshotFile } from "./src/types";
-import { chromium } from "playwright";
+import type { Page } from "playwright";
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
+const IS_VERCEL = Boolean(process.env.VERCEL);
+
+// Vercel serverless: hanya /tmp yang bisa ditulis. Di lokal tetap pakai ./data
+function getDataDir() {
+  return IS_VERCEL
+    ? path.join("/tmp", "screenshot-dashboard-data")
+    : path.join(process.cwd(), "data");
+}
 
 // -----------------------------------------------------------------------------
 // Screenshot capture tuning
@@ -15,8 +22,12 @@ const PORT = 3000;
 // Banyak layanan screenshot pihak ketiga akan mengembalikan gambar "placeholder"
 // jika halaman belum selesai render. Nilai ini menambah waktu tunggu & retry
 // agar peluang dapat screenshot "siap" lebih tinggi.
-const MICROLINK_WAIT_FOR_MS = Number(process.env.MICROLINK_WAIT_FOR_MS || 10000); // default 10s
-const MICROLINK_MAX_RETRIES = Number(process.env.MICROLINK_MAX_RETRIES || 2); // total attempt = 1 + retries
+const MICROLINK_WAIT_FOR_MS = Number(
+  process.env.MICROLINK_WAIT_FOR_MS || (IS_VERCEL ? 6000 : 10000)
+);
+const MICROLINK_MAX_RETRIES = Number(
+  process.env.MICROLINK_MAX_RETRIES || (IS_VERCEL ? 1 : 2)
+);
 const MICROLINK_RETRY_DELAY_MS = Number(process.env.MICROLINK_RETRY_DELAY_MS || 2500);
 const MIN_REAL_SCREENSHOT_BYTES = Number(process.env.MIN_REAL_SCREENSHOT_BYTES || 12_000); // heuristik sederhana
 
@@ -36,7 +47,322 @@ const BLOCKED_PAGE_PATTERNS: RegExp[] = [
   /\bverifying\.\.\.\b/i,
 ];
 
+async function waitForPromoPopup(page: Page) {
+  // Popup promo sering muncul 1–4 detik setelah halaman selesai load
+  await page.waitForTimeout(1200);
+  const popupHints = [
+    '[class*="popup" i]',
+    '[class*="modal" i]',
+    '[class*="mask" i]',
+    '[class*="overlay" i]',
+    '[class*="announce" i]',
+    '[class*="promo" i]',
+    '[role="dialog"]',
+    ".layui-layer",
+    ".swal2-container",
+    ".mask-close",
+  ];
+  for (const sel of popupHints) {
+    try {
+      await page.locator(sel).first().waitFor({ state: "visible", timeout: 2500 });
+      console.log(`[Playwright Capture] Popup terdeteksi: ${sel}`);
+      await page.waitForTimeout(600);
+      return;
+    } catch {}
+  }
+}
+
+type CloseTarget = { x: number; y: number; reason: string };
+
+async function findModalCloseTarget(page: Page): Promise<CloseTarget | null> {
+  return page.evaluate(() => {
+    const vw = window.innerWidth || 1280;
+    const vh = window.innerHeight || 800;
+
+    const isVisible = (el: Element) => {
+      const st = window.getComputedStyle(el);
+      if (st.display === "none" || st.visibility === "hidden" || Number(st.opacity) === 0) return false;
+      const r = (el as HTMLElement).getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+
+    const rectOf = (el: Element) => (el as HTMLElement).getBoundingClientRect();
+    const centerOf = (r: DOMRect) => ({ x: r.left + r.width / 2, y: r.top + r.height / 2 });
+
+    const looksLikeCloseText = (text: string) => /^[x×✕✖]$|^close$|^tutup$/i.test(text.trim());
+
+    const elementLooksLikeCloseButton = (el: Element) => {
+      if (!isVisible(el)) return false;
+      const r = rectOf(el);
+      if (r.width > 80 || r.height > 80) return false;
+
+      const aria = (el as HTMLElement).getAttribute("aria-label") || "";
+      const id = (el as HTMLElement).id || "";
+      const cls = (el as HTMLElement).className ? String((el as HTMLElement).className) : "";
+      const text = ((el as HTMLElement).innerText || "").trim();
+      const title = (el as HTMLElement).getAttribute("title") || "";
+      const st = window.getComputedStyle(el);
+      const isCircle =
+        st.borderRadius.includes("50%") ||
+        (parseFloat(st.borderRadius) >= Math.min(r.width, r.height) / 2 - 2 && r.width <= 60);
+
+      return (
+        /close|tutup|dismiss|cancel|mask-close|popup-close|btn-close|icon-close/i.test(aria + id + cls + title) ||
+        looksLikeCloseText(text) ||
+        (isCircle && r.width <= 55 && r.top <= vh * 0.35) ||
+        (el.tagName === "IMG" && /close|tutup|x\.png|icon.*x/i.test((el as HTMLImageElement).src || ""))
+      );
+    };
+
+    // 1) Cari modal/overlay besar di tengah layar (popup promo seperti KPBI)
+    const overlayCandidates = Array.from(document.querySelectorAll("div,section,aside,article")).filter((el) => {
+      if (!isVisible(el)) return false;
+      const r = rectOf(el);
+      const area = r.width * r.height;
+      if (area < vw * vh * 0.18) return false;
+      const st = window.getComputedStyle(el);
+      const posOk = st.position === "fixed" || st.position === "absolute";
+      if (!posOk) return false;
+      const z = parseInt(st.zIndex || "0", 10);
+      const id = (el as HTMLElement).id || "";
+      const cls = (el as HTMLElement).className ? String((el as HTMLElement).className) : "";
+      const role = (el as HTMLElement).getAttribute("role") || "";
+      const centered = r.left < vw * 0.75 && r.right > vw * 0.25 && r.top < vh * 0.85;
+      const looksLikeOverlay =
+        z >= 500 ||
+        /modal|popup|mask|overlay|backdrop|dialog|lightbox|announce|promo|layer/i.test(id + cls) ||
+        /dialog/i.test(role);
+      return centered && (looksLikeOverlay || z >= 100);
+    });
+
+    overlayCandidates.sort((a, b) => {
+      const ra = rectOf(a);
+      const rb = rectOf(b);
+      const za = parseInt(window.getComputedStyle(a).zIndex || "0", 10);
+      const zb = parseInt(window.getComputedStyle(b).zIndex || "0", 10);
+      return zb - za || rb.width * rb.height - ra.width * ra.height;
+    });
+
+    const modal = overlayCandidates[0] || null;
+
+    // 2) Cari tombol X di dalam modal / wrapper terdekat
+    const searchRoots: Element[] = modal
+      ? [modal, modal.parentElement, modal.parentElement?.parentElement].filter(Boolean) as Element[]
+      : [document.body];
+
+    for (const root of searchRoots) {
+      const closeEls = Array.from(root.querySelectorAll("button,a,div,span,i,img,svg")).filter(
+        elementLooksLikeCloseButton
+      );
+      closeEls.sort((a, b) => rectOf(a).top - rectOf(b).top);
+      if (closeEls.length > 0) {
+        const c = centerOf(rectOf(closeEls[0]));
+        return { x: c.x, y: c.y, reason: "close-button-in-modal" };
+      }
+    }
+
+    // 3) Tombol X kecil di area atas-tengah/kanan (posisi seperti screenshot user)
+    const topCloseCandidates = Array.from(document.querySelectorAll("button,a,div,span,i,img")).filter((el) => {
+      if (!isVisible(el)) return false;
+      const r = rectOf(el);
+      const inUpperBand = r.top >= 0 && r.top <= vh * 0.28;
+      const inHorizontalBand = r.left >= vw * 0.42 && r.right <= vw * 0.82;
+      const small = r.width <= 70 && r.height <= 70;
+      return inUpperBand && inHorizontalBand && small && elementLooksLikeCloseButton(el);
+    });
+    if (topCloseCandidates.length > 0) {
+      const c = centerOf(rectOf(topCloseCandidates[0]));
+      return { x: c.x, y: c.y, reason: "top-center-close" };
+    }
+
+    // 4) Fallback: klik pojok kanan-atas modal (tombol X lingkaran di luar/tepi modal)
+    if (modal) {
+      const r = rectOf(modal);
+      return {
+        x: Math.min(r.right - 8, vw - 8),
+        y: Math.max(r.top - 12, 12),
+        reason: "modal-top-right-fallback",
+      };
+    }
+
+    return null;
+  });
+}
+
+async function forceHideBlockingOverlays(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const vw = window.innerWidth || 1280;
+    const vh = window.innerHeight || 800;
+    let did = false;
+
+    const isVisible = (el: Element) => {
+      const st = window.getComputedStyle(el);
+      if (st.display === "none" || st.visibility === "hidden" || Number(st.opacity) === 0) return false;
+      const r = (el as HTMLElement).getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+
+    const nodes = Array.from(document.querySelectorAll("div,section,aside,article"));
+    for (const el of nodes) {
+      if (!isVisible(el)) continue;
+      const r = (el as HTMLElement).getBoundingClientRect();
+      const area = r.width * r.height;
+      if (area < vw * vh * 0.22) continue;
+      const st = window.getComputedStyle(el);
+      if (st.position !== "fixed" && st.position !== "absolute") continue;
+      const z = parseInt(st.zIndex || "0", 10);
+      const id = (el as HTMLElement).id || "";
+      const cls = (el as HTMLElement).className ? String((el as HTMLElement).className) : "";
+      const role = (el as HTMLElement).getAttribute("role") || "";
+      const looksLikeOverlay =
+        z >= 500 ||
+        /modal|popup|mask|overlay|backdrop|dialog|lightbox|announce|promo|layer/i.test(id + cls) ||
+        /dialog/i.test(role) ||
+        (st.backgroundColor.includes("rgba") && area >= vw * vh * 0.35);
+
+      if (!looksLikeOverlay) continue;
+      (el as HTMLElement).style.setProperty("display", "none", "important");
+      (el as HTMLElement).style.setProperty("pointer-events", "none", "important");
+      (el as HTMLElement).style.setProperty("visibility", "hidden", "important");
+      did = true;
+    }
+
+    document.body.style.overflow = "auto";
+    document.documentElement.style.overflow = "auto";
+    return did;
+  });
+}
+
+async function isLargeOverlayStillVisible(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const vw = window.innerWidth || 1280;
+    const vh = window.innerHeight || 800;
+    const nodes = Array.from(document.querySelectorAll("div,section,aside"));
+    for (const el of nodes) {
+      const st = window.getComputedStyle(el);
+      if (st.display === "none" || st.visibility === "hidden" || Number(st.opacity) === 0) continue;
+      const r = (el as HTMLElement).getBoundingClientRect();
+      if (r.width * r.height < vw * vh * 0.28) continue;
+      if (st.position !== "fixed" && st.position !== "absolute") continue;
+      const z = parseInt(st.zIndex || "0", 10);
+      const cls = (el as HTMLElement).className ? String((el as HTMLElement).className) : "";
+      if (z >= 500 || /modal|popup|mask|overlay|dialog|promo|announce/i.test(cls)) return true;
+    }
+    return false;
+  });
+}
+
+async function closeObstructivePopups(page: Page) {
+  // Auto-dismiss native dialogs (alert/confirm/prompt) agar tidak menghalangi screenshot
+  page.removeAllListeners("dialog");
+  page.on("dialog", async (dialog) => {
+    try {
+      console.log(`[Playwright Capture] Dismissing dialog: ${dialog.type()} "${dialog.message()?.slice(0, 80)}"`);
+      await dialog.dismiss();
+    } catch {}
+  });
+
+  await waitForPromoPopup(page);
+
+  const closeSelectors = [
+    ".mask-close",
+    '[class*="mask-close" i]',
+    '[class*="popup-close" i]',
+    '[class*="btn-close" i]',
+    '[class*="icon-close" i]',
+    '[class*="close-btn" i]',
+    '[class*="closeBtn" i]',
+    'img[alt="close" i]',
+    'img[src*="close" i]',
+    "div.close",
+    "div.close img",
+    "span.close",
+    "i.close",
+    'button[aria-label="Close"]',
+    'button[aria-label*="close" i]',
+    '[aria-label*="close" i]',
+    '[role="dialog"] [class*="close" i]',
+    '[role="dialog"] button',
+    ".close",
+    ".modal-close",
+    ".popup-close",
+    ".mfp-close",
+    ".fancybox-close-small",
+    ".swal2-close",
+    ".layui-layer-close",
+    'button:has-text("Close")',
+    'button:has-text("Tutup")',
+    'button:has-text("TUTUP")',
+    'button:has-text("Nanti")',
+    'button:has-text("Lewati")',
+    'button:has-text("Skip")',
+  ];
+
+  for (let round = 0; round < 5; round++) {
+    let clickedAny = false;
+
+    // Prioritas 1: deteksi modal + klik tombol X (termasuk lingkaran putih seperti contoh user)
+    const closeTarget = await findModalCloseTarget(page);
+    if (closeTarget) {
+      console.log(`[Playwright Capture] Klik tutup popup (${closeTarget.reason}) di (${Math.round(closeTarget.x)}, ${Math.round(closeTarget.y)})`);
+      await page.mouse.click(closeTarget.x, closeTarget.y).catch(() => {});
+      clickedAny = true;
+      await page.waitForTimeout(800);
+    }
+
+    // Prioritas 2: selector umum
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.waitForTimeout(200);
+
+    for (const sel of ['text=×', 'text=✕', 'text=X']) {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible().catch(() => false)) {
+        await loc.click({ timeout: 1200, force: true }).catch(() => {});
+        clickedAny = true;
+        await page.waitForTimeout(500);
+      }
+    }
+
+    for (const sel of closeSelectors) {
+      const loc = page.locator(sel).first();
+      if (!(await loc.isVisible().catch(() => false))) continue;
+      await loc.click({ timeout: 1200, force: true }).catch(() => {});
+      clickedAny = true;
+      await page.waitForTimeout(500);
+    }
+
+    // Verifikasi: popup masih menutupi layar?
+    const stillBlocked = await isLargeOverlayStillVisible(page);
+    if (stillBlocked) {
+      console.log("[Playwright Capture] Popup masih terlihat, paksa sembunyikan overlay...");
+      const forced = await forceHideBlockingOverlays(page);
+      if (forced) clickedAny = true;
+      await page.waitForTimeout(500);
+    }
+
+    const stillBlockedAfter = await isLargeOverlayStillVisible(page);
+    if (!stillBlockedAfter) {
+      console.log("[Playwright Capture] Popup berhasil ditutup, lanjut screenshot.");
+      break;
+    }
+
+    if (clickedAny) {
+      await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(700);
+      continue;
+    }
+
+    break;
+  }
+}
+
 async function captureRealScreenshotWithPlaywright(targetUrl: string): Promise<Buffer> {
+  // Playwright butuh browser binary (~300MB) — tidak cocok di Vercel serverless
+  if (IS_VERCEL) {
+    throw new Error("Playwright tidak didukung di Vercel serverless");
+  }
+
+  const { chromium } = await import("playwright");
   const browser = await chromium.launch({
     headless: true,
     args: [
@@ -70,6 +396,9 @@ async function captureRealScreenshotWithPlaywright(targetUrl: string): Promise<B
     // 3) Tambahan jeda kecil agar layout/render stabil
     await page.waitForTimeout(PLAYWRIGHT_EXTRA_STABLE_WAIT_MS);
 
+    // 3.5) Jika muncul popup/banner (seperti iklan / promo), klik close dulu sebelum screenshot
+    await closeObstructivePopups(page);
+
     // 4) Deteksi halaman verifikasi (Cloudflare/anti-bot) dan coba menunggu beberapa kali
     for (let round = 0; round < 3; round++) {
       const bodyText = (await page.textContent("body").catch(() => "")) || "";
@@ -83,6 +412,8 @@ async function captureRealScreenshotWithPlaywright(targetUrl: string): Promise<B
       await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
       await page.waitForLoadState("networkidle", { timeout: PLAYWRIGHT_TIMEOUT_MS }).catch(() => {});
       await page.waitForTimeout(1500);
+      // Setelah reload, coba tutup popup lagi jika muncul
+      await closeObstructivePopups(page);
     }
 
     const finalBodyText = (await page.textContent("body").catch(() => "")) || "";
@@ -90,7 +421,13 @@ async function captureRealScreenshotWithPlaywright(targetUrl: string): Promise<B
       throw new Error("Halaman masih tertahan verifikasi Cloudflare/anti-bot, tidak aman untuk discreenshot.");
     }
 
-    // 5) Screenshot
+    // 5) Screenshot — pastikan popup sudah hilang dulu
+    await closeObstructivePopups(page);
+    if (await isLargeOverlayStillVisible(page)) {
+      console.warn("[Playwright Capture] Overlay masih ada sebelum screenshot, paksa hide sekali lagi...");
+      await forceHideBlockingOverlays(page);
+      await page.waitForTimeout(500);
+    }
     const buf = (await page.screenshot({ fullPage: true, type: "png" })) as Buffer;
     if (!buf || buf.length < MIN_REAL_SCREENSHOT_BYTES) {
       throw new Error(`Screenshot real terlalu kecil/placeholder (${buf?.length || 0} bytes)`);
@@ -105,21 +442,44 @@ async function captureRealScreenshotWithPlaywright(targetUrl: string): Promise<B
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Directories
-const DATA_DIR = path.join(process.cwd(), "data");
+// Directories (lazy init agar aman di Vercel cold start)
+const DATA_DIR = getDataDir();
 const SCREENSHOTS_DIR = path.join(DATA_DIR, "screenshots");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 
-// Create directories if they do not exist
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR);
+function ensureDataDirs() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(SCREENSHOTS_DIR)) {
+    fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
+  }
 }
-if (!fs.existsSync(SCREENSHOTS_DIR)) {
-  fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
+
+ensureDataDirs();
+
+async function persistScreenshotFile(
+  filename: string,
+  imageBuffer: Buffer
+): Promise<{ imageUrl: string; filename: string }> {
+  if (process.env.BLOB_READ_WRITE_TOKEN) {
+    const { put } = await import("@vercel/blob");
+    const blob = await put(`screenshots/${filename}`, imageBuffer, {
+      access: "public",
+      contentType: "image/png",
+    });
+    return { imageUrl: blob.url, filename };
+  }
+
+  ensureDataDirs();
+  const filepath = path.join(SCREENSHOTS_DIR, filename);
+  fs.writeFileSync(filepath, imageBuffer);
+  return { imageUrl: `/screenshots/${filename}`, filename };
 }
 
 // Ensure database file exists
 function loadDatabase(): { spreadsheet: SpreadsheetRow[]; screenshots: ScreenshotFile[] } {
+  ensureDataDirs();
   try {
     if (fs.existsSync(DB_FILE)) {
       const parsed = JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
@@ -138,6 +498,7 @@ function loadDatabase(): { spreadsheet: SpreadsheetRow[]; screenshots: Screensho
 }
 
 function saveDatabase(data: { spreadsheet: SpreadsheetRow[]; screenshots: ScreenshotFile[] }) {
+  ensureDataDirs();
   fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
 }
 
@@ -150,7 +511,13 @@ app.use("/screenshots", express.static(SCREENSHOTS_DIR));
 
 // Health Check API
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", mode: process.env.NODE_ENV || "development" });
+  res.json({
+    status: "ok",
+    mode: process.env.NODE_ENV || "development",
+    platform: IS_VERCEL ? "vercel" : "node",
+    storage: process.env.BLOB_READ_WRITE_TOKEN ? "vercel-blob" : IS_VERCEL ? "tmp" : "local-disk",
+    dataDir: DATA_DIR,
+  });
 });
 
 // Load Spreadsheet Data
@@ -458,17 +825,26 @@ app.post("/api/save-screenshot", async (req, res) => {
 
     const timestamp = Date.now();
     const filename = `screenshot_${rowId}_${timestamp}.png`;
-    const filepath = path.join(SCREENSHOTS_DIR, filename);
 
-    // Save actual file to server directory
-    fs.writeFileSync(filepath, imageBuffer);
+    let imageUrl: string;
+    try {
+      const saved = await persistScreenshotFile(filename, imageBuffer);
+      imageUrl = saved.imageUrl;
+    } catch (writeErr: any) {
+      console.error("[Screenshot Save] Gagal menulis berkas:", writeErr);
+      return res.status(500).json({
+        error: IS_VERCEL
+          ? `Gagal menyimpan screenshot di Vercel: ${writeErr?.message || "filesystem error"}. Aktifkan Vercel Blob Storage untuk penyimpanan permanen.`
+          : writeErr?.message || "Gagal menulis berkas screenshot ke disk",
+      });
+    }
 
-    // Dynamic imageUrl
-    const imageUrl = `/screenshots/${filename}`;
-    const host = req.get('host') || 'localhost:3000';
-    const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+    const host = req.get("host") || "localhost:3000";
+    const protocol = req.headers["x-forwarded-proto"] || req.protocol || "http";
     const origin = `${protocol}://${host}`;
-    const absoluteImageUrl = `${origin}${imageUrl}`;
+    const absoluteImageUrl = imageUrl.startsWith("http")
+      ? imageUrl
+      : `${origin}${imageUrl}`;
 
     const db = loadDatabase();
 
@@ -612,6 +988,7 @@ app.delete("/api/screenshots/:id", (req, res) => {
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     // Vite Dev Mode setup
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
@@ -628,8 +1005,13 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`[Dashboard Backend] Server running on http://0.0.0.0:${PORT}`);
-    console.log(`[Dashboard Backend] Persistent directories and database verified.`);
+    console.log(`[Dashboard Backend] Data directory: ${DATA_DIR}`);
   });
 }
 
-startServer();
+export { app };
+
+// Di Vercel, server dijalankan lewat api/index.ts (serverless), bukan listen()
+if (!IS_VERCEL) {
+  startServer();
+}
