@@ -1,6 +1,10 @@
+import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { app } from "../server";
 
-export default app;
+// Wrapper eksplisit agar kompatibel dengan Vercel Node Function handler.
+export default function handler(req: VercelRequest, res: VercelResponse) {
+  return (app as any)(req, res);
+}
 
 export const config = {
   // Vercel config mendukung runtime: "nodejs" | "edge" | "experimental-edge"
